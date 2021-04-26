@@ -3,6 +3,7 @@ from keras_applications import get_submodules_from_kwargs
 from ._common_blocks import Conv2dBn
 from ._utils import freeze_model, filter_keras_submodules
 from ..backbones.backbones_factory import Backbones
+from .cbam import CBAM
 
 backend = None
 layers = None
@@ -102,6 +103,109 @@ def DecoderTransposeX2Block(filters, stage, use_batchnorm=False):
     return layer
 
 
+def DecoderCustomChannelBlockV2(filters, stage, use_batchnorm=False):
+    # from efficientnet.model import get_swish
+    # conv_activation = get_swish(backend=backend, layers=layers, models=models, utils=keras_utils)
+    # conv_act_name = 'swish'
+
+    conv_activation = conv_act_name = 'relu'
+
+    up_name = 'decoder_stage{}_upsampling'.format(stage)
+    conv_name = 'decoder_stage{}'.format(stage)
+    concat_name = 'decoder_stage{}_concat'.format(stage)
+    conv_concat_name = 'decoder_stage{}_abc'.format(stage)
+    shortcut_name = 'decoder_stage{}_shortcut'.format(stage)
+    res_name = 'decoder_stage{}_res'.format(stage)
+    att_name = 'decoder_stage{}_att'.format(stage)
+
+    concat_axis = 3 if backend.image_data_format() == 'channels_last' else 1
+
+    def wrapper(input_tensor, skip=None):
+        x = layers.UpSampling2D(size=2, name=up_name)(input_tensor)
+
+        if skip is not None:
+            x = layers.Concatenate(axis=concat_axis, name=concat_name)([x, skip])
+
+        if backend.int_shape(x)[-1] != filters:
+            shortcut = Conv2dBn(filters, kernel_size=(1, 1), activation=None, kernel_initializer='he_uniform',
+                                padding='same', use_batchnorm=use_batchnorm, name=shortcut_name,
+                                **get_submodules())(x)
+        else:
+            shortcut = x
+
+        a = Conv2dBn(filters // 6, kernel_size=(3, 3), activation=None, kernel_initializer='he_uniform',
+                     padding='same', use_batchnorm=use_batchnorm, name=conv_name + '_a', **get_submodules())(x)
+
+        b = layers.Activation(conv_activation, name=conv_name + '_a_' + conv_act_name)(a)
+        b = Conv2dBn(filters // 3, kernel_size=(3, 3), activation=None, kernel_initializer='he_uniform',
+                     padding='same', use_batchnorm=use_batchnorm, name=conv_name + '_b', **get_submodules())(b)
+
+        c = layers.Activation(conv_activation, name=conv_name + '_b_' + conv_act_name)(b)
+        c = Conv2dBn(filters // 2, kernel_size=(3, 3), activation=None, kernel_initializer='he_uniform',
+                     padding='same', use_batchnorm=use_batchnorm, name=conv_name + '_c', **get_submodules())(c)
+
+        x = layers.Concatenate(axis=concat_axis, name=conv_concat_name)([a, b, c])
+
+        x = CBAM(name=att_name, ratio=6, kernel_size=7)(x)
+
+        x = layers.Add(name=res_name + '_add')([x, shortcut])
+        x = layers.Activation(conv_activation, name=res_name + '_' + conv_act_name)(x)
+
+        return x
+
+    return wrapper
+
+
+def DecoderCustomChannelBlock(filters, stage, use_batchnorm=False):
+    # from efficientnet.model import get_swish
+    # conv_activation = get_swish(backend=backend, layers=layers, models=models, utils=keras_utils)
+    # conv_act_name = 'swish'
+
+    conv_activation = conv_act_name = 'relu'
+
+    up_name = 'decoder_stage{}_upsampling'.format(stage)
+    conv_name = 'decoder_stage{}'.format(stage)
+    concat_name = 'decoder_stage{}_concat'.format(stage)
+    conv_concat_name = 'decoder_stage{}_stack'.format(stage)
+    shortcut_name = 'decoder_stage{}_shortcut'.format(stage)
+    res_name = 'decoder_stage{}_residual'.format(stage)
+
+    concat_axis = 3 if backend.image_data_format() == 'channels_last' else 1
+
+    def wrapper(input_tensor, skip=None):
+        x = layers.UpSampling2D(size=2, name=up_name)(input_tensor)
+
+        if skip is not None:
+            x = layers.Concatenate(axis=concat_axis, name=concat_name)([x, skip])
+
+        if backend.int_shape(x)[-1] != filters:
+            shortcut = Conv2dBn(filters, kernel_size=(1, 1), activation=None, kernel_initializer='he_uniform',
+                                padding='same', use_batchnorm=use_batchnorm, name=shortcut_name,
+                                **get_submodules())(x)
+        else:
+            shortcut = x
+
+        a = Conv2dBn(filters // 4, kernel_size=(3, 3), activation=None, kernel_initializer='he_uniform',
+                     padding='same', use_batchnorm=use_batchnorm, name=conv_name + 'a', **get_submodules())(x)
+
+        b = layers.Activation(conv_activation, name=conv_name + 'a_' + conv_act_name)(a)
+        b = Conv2dBn(filters // 4, kernel_size=(3, 3), activation=None, kernel_initializer='he_uniform',
+                     padding='same', use_batchnorm=use_batchnorm, name=conv_name + 'b', **get_submodules())(b)
+
+        c = layers.Activation(conv_activation, name=conv_name + 'b_' + conv_act_name)(b)
+        c = Conv2dBn(filters // 2, kernel_size=(3, 3), activation=None, kernel_initializer='he_uniform',
+                     padding='same', use_batchnorm=use_batchnorm, name=conv_name + 'c', **get_submodules())(c)
+
+        x = layers.Concatenate(axis=concat_axis, name=conv_concat_name)([a, b, c])
+
+        x = layers.Add(name=res_name + '_add')([x, shortcut])
+        x = layers.Activation(conv_activation, name=res_name + '_' + conv_act_name)(x)
+
+        return x
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------
 #  Unet Decoder
 # ---------------------------------------------------------------------
@@ -180,7 +284,7 @@ def Unet(
             extractor to build segmentation model.
         input_shape: shape of input data/image ``(H, W, C)``, in general
             case you do not need to set ``H`` and ``W`` shapes, just pass ``(None, None, C)`` to make your model be
-            able to process images af any size, but ``H`` and ``W`` of input images should be divisible by factor ``32``.
+            able to process images af any size, but ``H`` and ``W`` of input images should be divisible by factor `32`.
         classes: a number of classes for output (output shape - ``(h, w, classes)``).
         activation: name of one of ``keras.activations`` for last model layer
             (e.g. ``sigmoid``, ``softmax``, ``linear``).
@@ -215,6 +319,10 @@ def Unet(
         decoder_block = DecoderUpsamplingX2Block
     elif decoder_block_type == 'transpose':
         decoder_block = DecoderTransposeX2Block
+    elif decoder_block_type == 'custom':
+        decoder_block = DecoderCustomChannelBlock
+    elif decoder_block_type == 'customv2':
+        decoder_block = DecoderCustomChannelBlockV2
     else:
         raise ValueError('Decoder block type should be in ("upsampling", "transpose"). '
                          'Got: {}'.format(decoder_block_type))
